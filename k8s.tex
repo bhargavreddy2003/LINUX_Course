@@ -1,0 +1,542 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{courier}
+\usepackage{titlesec}
+\usepackage{setspace}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+\title{Kubernetes HA Cluster End-to-End Guide (v1.35.1)\\\large Infra Developer Perspective - 5 VM Stacked etcd Topology}
+\author{}
+\date{February 19, 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Overview}
+
+This document describes an end-to-end, high-availability (HA) Kubernetes cluster setup using kubeadm on five virtual machines (VMs), aligned with Kubernetes v1.35.1. It is written from an infrastructure developer point of view, focusing on:
+
+\begin{itemize}[nosep]
+  \item End-to-end flow from fresh VMs to a production-ready HA cluster.
+  \item Which components (etcd, kubelet, kube-apiserver, etc.) run where.
+  \item Which files and systemd services are involved and how they interlink.
+  \item How control-plane and worker nodes handshake at runtime.
+  \item How to perform an end-to-end upgrade with kubeadm.
+\end{itemize}
+
+The target architecture is a three-node stacked-etcd control plane and two worker nodes, with a virtual IP (VIP) or external load balancer in front of the control plane.
+
+\section{Target Architecture and Version}
+
+\subsection{Kubernetes Version}
+
+\begin{itemize}[nosep]
+  \item Kubernetes v1.35.1 (released February 2026).
+  \item Kubernetes upstream supports N--2 minor versions (1.35, 1.34, 1.33 at this time).
+  \item Upgrades are performed one minor version at a time (for example, 1.34 to 1.35).
+  \item cgroup v2 is mandatory; cgroup v1 support has been removed.
+\end{itemize}
+
+\subsection{5 VM HA Topology (Stacked etcd)}
+
+The cluster uses a stacked-etcd topology:\\
+
+\noindent 3~\textbf{Control plane nodes} (each also runs etcd):
+
+\begin{itemize}[nosep]
+  \item etcd member (static Pod).
+  \item kube-apiserver (static Pod).
+  \item kube-controller-manager (static Pod).
+  \item kube-scheduler (static Pod).
+  \item kubelet (node agent).
+  \item kube-proxy (or equivalent CNI proxy).
+\end{itemize}
+
+\noindent 2~\textbf{Worker nodes}:
+
+\begin{itemize}[nosep]
+  \item kubelet.
+  \item kube-proxy.
+  \item CNI agent and application workloads.
+\end{itemize}
+
+A virtual IP (VIP) or external Layer-4 load balancer fronts the three kube-apiserver instances on port~6443.
+
+\section{Core Kubernetes Components and Placement}
+
+Kubernetes consists of a set of cooperating processes.
+
+\subsection{Control Plane Components}
+
+\begin{itemize}[nosep]
+  \item \textbf{kube-apiserver}: Serves the Kubernetes API (HTTPS on port~6443). It is stateless and reads/writes cluster state in etcd.
+  \item \textbf{etcd}: Key--value store for all cluster state. In a stacked-etcd setup, each control-plane node runs a member of the etcd cluster.
+  \item \textbf{kube-controller-manager}: Runs control loops such as node controller, replication controller, endpoints controller, and service account controllers.
+  \item \textbf{kube-scheduler}: Assigns newly created Pods to Nodes based on resource availability and constraints.
+  \item \textbf{cloud-controller-manager} (optional): Integrates Kubernetes with cloud provider features (load balancers, volumes, etc.).
+\end{itemize}
+
+All of these run as \emph{static Pods} on control-plane nodes when using kubeadm.
+
+\subsection{Node Components}
+
+Every node (control plane and worker) runs:
+
+\begin{itemize}[nosep]
+  \item \textbf{kubelet}: Node agent that watches for PodSpecs through the API server and ensures containers conform to the desired state.
+  \item \textbf{kube-proxy} (or equivalent): Maintains per-node networking rules (iptables or nftables) to implement Services and load-balancing.
+  \item \textbf{Container runtime}: Typically containerd or CRI-O, responsible for image management and container lifecycle.
+\end{itemize}
+
+Control-plane nodes are usually tainted to prevent regular workloads from scheduling on them, but they still run kubelet and, in most clusters, kube-proxy as well.
+
+\section{On-Disk Layout and Key Services (kubeadm-Based)}
+
+\subsection{systemd Services}
+
+On every node, the principal systemd service is:
+
+\begin{lstlisting}[language=bash]
+/etc/systemd/system/kubelet.service
+/etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+\end{lstlisting}
+
+The kubelet systemd unit and drop-in configuration generally specify:
+
+\begin{itemize}[nosep]
+  \item \verb|--kubeconfig=/etc/kubernetes/kubelet.conf|
+  \item \verb|--config=/var/lib/kubelet/config.yaml|
+  \item \verb|--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf| (during bootstrap)
+\end{itemize}
+
+Control-plane processes (etcd, kube-apiserver, kube-controller-manager, kube-scheduler) are \emph{not} separate systemd services in a kubeadm cluster. They run as static Pods defined on disk.
+
+\subsection{Static Pod Manifests (Control Plane Nodes)}
+
+Static Pod manifests are stored under:
+
+\begin{lstlisting}[language=bash]
+/etc/kubernetes/manifests/
+  etcd.yaml
+  kube-apiserver.yaml
+  kube-controller-manager.yaml
+  kube-scheduler.yaml
+\end{lstlisting}
+
+The kubelet watches this directory. Any change to these YAML files causes the corresponding Pod to be recreated.
+
+\subsection{PKI and Kubeconfig Files}
+
+The primary PKI and kubeconfig files reside in:\\
+
+\noindent \verb|/etc/kubernetes/| and \verb|/etc/kubernetes/pki/|, for example:
+
+\begin{itemize}[nosep]
+  \item \verb|/etc/kubernetes/pki/ca.crt|, \verb|ca.key|: Cluster Certificate Authority.
+  \item \verb|apiserver.crt|, \verb|apiserver.key|: API server certificate and key.
+  \item \verb|apiserver-kubelet-client.crt|: Client cert used by the API server to call kubelets.
+  \item \verb|pki/etcd/ca.crt|, \verb|server.crt|, \verb|peer.crt|: etcd CA and member certs.
+  \item \verb|sa.key|, \verb|sa.pub|: Service account signing keys.
+  \item \verb|admin.conf|: Kubeconfig for cluster admin (used by kubectl).
+  \item \verb|controller-manager.conf|, \verb|scheduler.conf|: Kubeconfigs for control-plane components.
+  \item \verb|kubelet.conf|, \verb|bootstrap-kubelet.conf|: Kubelet client configs.
+\end{itemize}
+
+\subsection{CNI and kube-proxy Files}
+
+\begin{itemize}[nosep]
+  \item CNI plugin binaries: \verb|/opt/cni/bin|
+  \item CNI configurations: \verb|/etc/cni/net.d/*.conf|
+  \item The kube-proxy DaemonSet uses a ConfigMap (often named \verb|kube-proxy| in the \verb|kube-system| namespace) to store its mode (iptables or nftables) and tuning parameters.
+\end{itemize}
+
+\section{Cluster Bootstrap: End-to-End Flow with kubeadm}
+
+Assume all five VMs are fresh Linux hosts with systemd and cgroup v2 enabled.
+
+\subsection{Prerequisites on All Nodes}
+
+Typical preparatory steps include:
+
+\begin{itemize}[nosep]
+  \item Enable cgroup v2 and ensure the container runtime is configured to use systemd cgroups.
+  \item Install container runtime (for example, containerd) and Kubernetes binaries (kubeadm, kubelet, kubectl) pinned to the desired version.
+  \item Disable swap, configure kernel modules and sysctl (\verb|br_netfilter|, IP forwarding, etc.).
+  \item Configure NTP/time synchronization and ensure full network connectivity among all nodes.
+\end{itemize}
+
+Example commands (simplified):
+
+\begin{lstlisting}[language=bash]
+# Install containerd, kubeadm, kubelet, kubectl (versions are examples)
+apt-get update
+apt-get install -y containerd.io kubeadm=1.35.1-00 kubelet=1.35.1-00 kubectl=1.35.1-00
+
+swapoff -a
+sed -i '/ swap / s/^/#/' /etc/fstab
+modprobe overlay
+modprobe br_netfilter
+\end{lstlisting}
+
+\subsection{Control Plane Endpoint (VIP / Load Balancer)}
+
+Before initializing the first control-plane node, define a stable endpoint for the control plane:\\
+
+\noindent Options:
+
+\begin{itemize}[nosep]
+  \item External Layer-4 load balancer in front of the three API servers on port~6443.
+  \item kube-vip static Pods on the control-plane nodes, advertising a VIP using ARP or BGP.
+\end{itemize}
+
+With kube-vip, a static Pod manifest (for example, \verb|/etc/kubernetes/manifests/kube-vip.yaml|) is placed on each control-plane node, and your kubeadm \texttt{ClusterConfiguration} uses the VIP DNS name or IP in \verb|controlPlaneEndpoint|.
+
+\subsection{Initialize the First Control-Plane Node}
+
+Example kubeadm configuration file:
+
+\begin{lstlisting}[language=bash]
+cat > /root/kubeadm-config.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.35.1
+controlPlaneEndpoint: "k8s-vip.example.com:6443"
+networking:
+  podSubnet: "10.244.0.0/16"
+EOF
+
+kubeadm init --config /root/kubeadm-config.yaml --upload-certs
+\end{lstlisting}
+
+High-level steps performed by \verb|kubeadm init|:
+
+\begin{enumerate}[nosep]
+  \item Runs preflight checks (OS, ports, cgroups, container runtime).
+  \item Generates PKI in \verb|/etc/kubernetes/pki|.
+  \item Generates kubeconfig files in \verb|/etc/kubernetes| (admin, controller-manager, scheduler, kubelet).
+  \item Writes static Pod manifests to \verb|/etc/kubernetes/manifests|. The kubelet sees these and starts etcd, kube-apiserver, kube-controller-manager, and kube-scheduler.
+  \item Bootstraps the kubelet by writing \verb|/var/lib/kubelet/config.yaml| and \verb|/etc/kubernetes/kubelet.conf|.
+  \item Uploads the kubeadm configuration to the cluster as the \verb|kubeadm-config| ConfigMap.
+  \item Deploys core add-ons such as CoreDNS and the kube-proxy DaemonSet.
+\end{enumerate}
+
+Kubelet performs a TLS bootstrap: it uses a bootstrap kubeconfig, submits a certificate signing request (CSR) to the API server, and receives a signed client certificate that is persisted in \verb|/etc/kubernetes/kubelet.conf|.
+
+\subsection{Join Additional Control-Plane Nodes}
+
+On control-plane nodes 2 and 3, run a join command similar to:
+
+\begin{lstlisting}[language=bash]
+kubeadm join k8s-vip.example.com:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane \
+  --certificate-key <cert-key>
+\end{lstlisting}
+
+Under the hood, kubeadm:
+
+\begin{itemize}[nosep]
+  \item Performs discovery and validates the CA hash.
+  \item Fetches and/or generates necessary certificates for this control-plane node.
+  \item Sets up \verb|/etc/kubernetes/pki| with the appropriate certs.
+  \item Writes static Pod manifests for etcd and the other control-plane components on this node.
+  \item Adds the new etcd member to the etcd cluster and reconfigures membership.
+  \item Bootstraps the kubelet in the same manner as on the first control-plane node.
+\end{itemize}
+
+\subsection{Join Worker Nodes}
+
+On each worker node:
+
+\begin{lstlisting}[language=bash]
+kubeadm join k8s-vip.example.com:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash>
+\end{lstlisting}
+
+The sequence is:
+
+\begin{enumerate}[nosep]
+  \item kubelet uses \verb|bootstrap-kubelet.conf| to contact the API server and authenticate using the bootstrap token.
+  \item kubelet submits a CSR; the cluster's CSR approving controller approves it.
+  \item kubelet receives a signed client certificate and writes \verb|/etc/kubernetes/kubelet.conf|.
+  \item kubelet registers a \verb|Node| object with labels, capacity, and addresses.
+  \item kube-proxy and the CNI plugin schedule Pods on the worker, joining it to the cluster network.
+\end{enumerate}
+
+\section{Runtime Handshake Flows Between Components}
+
+\subsection{Control Plane Interactions}
+
+\begin{itemize}[nosep]
+  \item \textbf{kube-apiserver} communicates with \textbf{etcd} over TLS, persisting all cluster resources.
+  \item \textbf{kube-controller-manager} watches API resources and writes back status and new objects (for example, ReplicaSets, Endpoints, ServiceAccounts).
+  \item \textbf{kube-scheduler} watches for unscheduled Pods and binds them to suitable Nodes via the API server.
+  \item Optionally, \textbf{cloud-controller-manager} integrates with the cloud provider, watching and updating cloud resources.
+\end{itemize}
+
+All control-plane components authenticate using client certificates issued by the cluster CA and referenced in their static Pod manifests.
+
+\subsection{Node--Control Plane (kubelet Handshake)}
+
+On each node, the kubelet:
+
+\begin{itemize}[nosep]
+  \item Maintains watches on the API server for Pods assigned to that node.
+  \item Uses the container runtime to pull images and start containers corresponding to PodSpecs.
+  \item Reports Pod status back to the API server.
+\end{itemize}
+
+Key local files:
+
+\begin{itemize}[nosep]
+  \item \verb|/etc/kubernetes/kubelet.conf|: kubelet's kubeconfig for authenticating to the API server.
+  \item \verb|/var/lib/kubelet/config.yaml|: kubelet configuration (resource reservations, eviction thresholds, etc.).
+\end{itemize}
+
+\subsection{Service Traffic Path}
+
+When a Service and Deployment are created:
+
+\begin{enumerate}[nosep]
+  \item The Service and Pod templates are persisted to etcd via the API server.
+  \item Controllers create EndpointSlice objects linking Services to Pod IPs.
+  \item kube-proxy DaemonSets on each node watch Services and EndpointSlices and program iptables or nftables rules.
+  \item Traffic from a Pod to a Service IP hits node-local rules and is DNATed to one of the backend Pod IPs.
+\end{enumerate}
+
+In v1.35, kube-proxy IPVS mode is deprecated in favor of iptables or nftables modes.
+
+\section{Configuration Locations and Management}
+
+From an infrastructure point of view, configuration is managed at several layers.
+
+\subsection{Cluster-Level Configuration}
+
+\begin{itemize}[nosep]
+  \item \textbf{kubeadm ClusterConfiguration}: Initially provided as YAML to \verb|kubeadm init| and stored in the \verb|kubeadm-config| ConfigMap in the \verb|kube-system| namespace.
+  \item \textbf{kubelet configuration}: Stored both in a ConfigMap (for example, \verb|kubelet-config-1.35|) and locally at \verb|/var/lib/kubelet/config.yaml|.
+  \item \textbf{kube-proxy configuration}: Stored in the \verb|kube-proxy| ConfigMap, controlling proxy mode (iptables or nftables), clusterCIDR, and other settings.
+\end{itemize}
+
+Best practice is to treat the kubeadm configuration and related ConfigMaps as the source of truth and regenerate on-node artifacts via kubeadm when needed.
+
+\subsection{Control-Plane Component Configuration}
+
+Control-plane components are configured via flags and configuration files specified in their static Pod manifests:
+
+\begin{itemize}[nosep]
+  \item kube-apiserver: \verb|/etc/kubernetes/manifests/kube-apiserver.yaml|
+  \item kube-controller-manager: \verb|/etc/kubernetes/manifests/kube-controller-manager.yaml|
+  \item kube-scheduler: \verb|/etc/kubernetes/manifests/kube-scheduler.yaml|
+  \item etcd: \verb|/etc/kubernetes/manifests/etcd.yaml|
+\end{itemize}
+
+Rather than editing these files directly, use kubeadm configuration (ClusterConfiguration and component-specific extraArgs/extraVolumes) and let kubeadm regenerate the manifests, especially during upgrades.
+
+\subsection{etcd Configuration}
+
+In stacked-etcd mode, the etcd static Pod manifest includes:
+
+\begin{itemize}[nosep]
+  \item Listening and advertise URLs (client and peer).
+  \item Initial cluster configuration (\verb|--initial-cluster|, \verb|--initial-cluster-state|).
+  \item TLS-related flags (\verb|--cert-file|, \verb|--key-file|, \verb|--trusted-ca-file|).
+  \item Data directory (commonly \verb|/var/lib/etcd| mounted from the host).
+\end{itemize}
+
+\subsection{kubelet Configuration (Per Node)}
+
+The kubelet configuration is split between:
+
+\begin{itemize}[nosep]
+  \item \verb|/var/lib/kubelet/config.yaml|: Captures settings from the KubeletConfiguration API (eviction policies, cgroup driver, feature gates, TLS settings, etc.).
+  \item Systemd unit and drop-in (for example, \verb|kubelet.service| and \verb|10-kubeadm.conf|) specifying paths to kubeconfig and configuration files.
+\end{itemize}
+
+Cluster-wide kubelet configuration is typically managed through the \verb|kubelet-config-x.y| ConfigMap and applied to nodes using kubeadm phases (for example, \verb|kubeadm upgrade node phase kubelet-config|).
+
+\section{End-to-End Upgrade Flow (1.35.x Perspective)}
+
+\subsection{Pre-Upgrade Checks}
+
+Prior to upgrading to v1.35.x:
+
+\begin{itemize}[nosep]
+  \item Ensure all nodes run cgroup v2; kubelet will not start on cgroup v1-only systems.
+  \item If using kube-proxy IPVS mode, plan and test migration to iptables or nftables.
+  \item Validate that the container runtime (for example, containerd) versions are supported for v1.35.
+  \item Review the Kubernetes v1.35 release notes for removed or deprecated APIs and features.
+\end{itemize}
+
+\subsection{Upgrading Control-Plane Nodes}
+
+For a minor upgrade (for example, 1.34.x to 1.35.1), upgrade control-plane nodes one at a time.
+
+\paragraph{On the first control-plane node:}
+
+\begin{lstlisting}[language=bash]
+apt-mark unhold kubeadm
+apt-get update
+apt-get install -y kubeadm=1.35.1-00
+apt-mark hold kubeadm
+
+kubeadm upgrade plan
+kubeadm upgrade apply v1.35.1
+\end{lstlisting}
+
+\verb|kubeadm upgrade apply| performs:
+
+\begin{itemize}[nosep]
+  \item Health and skew checks.
+  \item Downloads new control-plane container images.
+  \item Regenerates component configurations if necessary.
+  \item Rewrites static Pod manifests under \verb|/etc/kubernetes/manifests| with updated image tags and arguments.
+  \item Updates core add-ons (CoreDNS, kube-proxy) after control-plane instances are upgraded.
+\end{itemize}
+
+Then upgrade kubelet and kubectl on that node:
+
+\begin{lstlisting}[language=bash]
+apt-mark unhold kubelet kubectl
+apt-get install -y kubelet=1.35.1-00 kubectl=1.35.1-00
+apt-mark hold kubelet kubectl
+
+systemctl daemon-reload
+systemctl restart kubelet
+\end{lstlisting}
+
+\paragraph{On the remaining control-plane nodes:}
+
+Upgrade kubeadm, then run the node-specific control-plane upgrade commands (for example, \verb|kubeadm upgrade node| or \verb|kubeadm upgrade node phase control-plane| depending on documentation), followed by upgrading kubelet and kubectl and restarting kubelet.
+
+Throughout, the control-plane endpoint (VIP or load balancer) continues serving API requests as nodes are upgraded in a rolling fashion.
+
+\subsection{Upgrading Worker Nodes}
+
+After all control-plane nodes are upgraded, upgrade each worker node one at a time:
+
+\begin{lstlisting}[language=bash]
+# On worker node
+kubectl cordon <node>
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+
+apt-mark unhold kubeadm
+apt-get install -y kubeadm=1.35.1-00
+apt-mark hold kubeadm
+
+kubeadm upgrade node
+
+apt-mark unhold kubelet kubectl
+apt-get install -y kubelet=1.35.1-00 kubectl=1.35.1-00
+apt-mark hold kubelet kubectl
+
+systemctl daemon-reload
+systemctl restart kubelet
+
+kubectl uncordon <node>
+\end{lstlisting}
+
+\section{v1.35-Specific Features Relevant to Infra}
+
+From an infrastructure developer point of view, v1.35 introduces several important changes:
+
+\subsection{Breaking and Deprecating Changes}
+
+\begin{itemize}[nosep]
+  \item \textbf{cgroup v1 removed}: All nodes must use cgroup v2.
+  \item \textbf{kube-proxy IPVS mode deprecated}: Clusters should move to iptables or nftables modes.
+  \item \textbf{Runtime requirements tightened}: Older container runtime versions may no longer be supported.
+\end{itemize}
+
+\subsection{New and Promoted Features}
+
+\begin{itemize}[nosep]
+  \item \textbf{In-place Pod resource updates} (GA): Allows updating CPU/memory requests and limits without restarting Pods, improving SLOs and enabling more flexible vertical scaling strategies.
+  \item \textbf{Node-declared features} (alpha): Nodes can advertise capabilities (such as GPU or AI accelerators) in their status for more intelligent scheduling decisions.
+  \item \textbf{Sidecar containers} (beta/GA depending on minor): More robust patterns for sidecars that need distinct lifecycle behavior.
+\end{itemize}
+
+Most of these features are controlled via feature gates and component configurations (API server, scheduler, kubelet) and should be considered when designing infra-level policies.
+
+\section{Infra Best Practices}
+
+\subsection{Treat kubeadm Configuration as Source of Truth}
+
+\begin{itemize}[nosep]
+  \item Maintain a version-controlled kubeadm configuration file (ClusterConfiguration, KubeletConfiguration) in Git.
+  \item Avoid manual drift in static manifests and kubelet configs by regenerating them with kubeadm.
+  \item Use \verb|kubeadm config view| and the \verb|kubeadm-config| ConfigMap to inspect the currently applied cluster configuration.
+\end{itemize}
+
+\subsection{Files to Avoid Editing Directly}
+
+\begin{itemize}[nosep]
+  \item \verb|/etc/kubernetes/manifests/*|: Static Pod manifests for control-plane components (managed by kubeadm).
+  \item \verb|/var/lib/kubelet/config.yaml|: kubelet configuration (should be managed via the cluster-wide ConfigMap and kubeadm phases).
+  \item \verb|/etc/kubernetes/pki/*|: Cluster PKI (use kubeadm certificate management or well-defined rotation procedures).
+\end{itemize}
+
+\subsection{Files Safe to Edit Directly}
+
+\begin{itemize}[nosep]
+  \item CNI configurations (for example, \verb|/etc/cni/net.d/*|) with understanding of the plugin.
+  \item kube-proxy ConfigMap (for example, to change proxy mode or tune sync periods), followed by rolling restart of the DaemonSet.
+  \item kubeadm configuration YAML under version control, then re-applied using kubeadm operations.
+\end{itemize}
+
+\subsection{Backup and Disaster Recovery}
+
+Minimal backup set for control-plane recovery:
+
+\begin{itemize}[nosep]
+  \item Regular etcd snapshots (for example, \verb|etcdctl snapshot save backup.db|) from at least one control-plane node.
+  \item \verb|/etc/kubernetes/pki| (CA and all certs/keys).
+  \item \verb|/etc/kubernetes| (kubeconfigs and manifests).
+  \item Exported kubeadm cluster configuration:
+\end{itemize}
+
+\begin{lstlisting}[language=bash]
+kubectl -n kube-system get cm kubeadm-config -o yaml > kubeadm-config-backup.yaml
+\end{lstlisting}
+
+With these, you can generally rebuild control-plane nodes and rejoin workers after catastrophic failures.
+
+\section{Architecture Summary}
+
+From power-on to steady-state operations and upgrades, the flow is:
+
+\begin{enumerate}[nosep]
+  \item Provision five VMs with cgroup v2 and install container runtime and Kubernetes binaries (kubeadm, kubelet, kubectl).
+  \item Configure a control-plane endpoint (VIP or external load balancer) for the API server.
+  \item Run \verb|kubeadm init| on the first control-plane node to generate PKI, kubeconfigs, and static manifests. kubelet starts the control-plane components as static Pods.
+  \item Join additional control-plane nodes with \verb|kubeadm join --control-plane|. etcd cluster membership and control-plane Pods are created on each node.
+  \item Join worker nodes using \verb|kubeadm join|, completing kubelet TLS bootstrap and registering Node objects.
+  \item At runtime, users and controllers communicate with kube-apiserver; kube-apiserver persists state to etcd; scheduler and controllers drive Pod placement; kubelets realize Pods; kube-proxy programs Service traffic.
+  \item For upgrades, treat the kubeadm configuration and associated ConfigMaps as canonical, and use \verb|kubeadm upgrade| commands to roll the cluster forward minor and patch versions.
+\end{enumerate}
+
+Kubeadm-managed configuration and ConfigMaps should be regarded as the primary source of truth, with static Pod manifests and kubelet configs treated as derived artifacts.
+
+\end{document}
